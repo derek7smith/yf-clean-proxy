@@ -1,18 +1,32 @@
 import express from "express";
 import fetch from "node-fetch";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 
 const app = express();
 
-// Remove charts and client scripts so no graph appears and the page does not auto update
+// fetch with a timeout so requests do not hang forever
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal, ...opts });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// remove charts and client scripts so the graph cannot appear or rehydrate
 function harden($) {
-  $('[data-test="qsp-chart"]').remove();
-  $('[data-testid="chart-container"]').remove();
-  $('[data-test="sparkline"]').remove();
+  $('[data-test="qsp-chart"]').remove();           // main quote chart section
+  $('[data-testid="chart-container"]').remove();   // generic chart container
+  $('[data-test="sparkline"]').remove();           // tiny line charts
   $('[class*="sparkline"]').remove();
-  $('[id*="chart"]').remove();
+
+  $('[id*="chart"]').remove();                     // fallbacks
   $('[class*="chart"]').remove();
 
+  // remove likely chart SVGs
   $('svg').each((_, el) => {
     const $el = $(el);
     if ($el.closest('[role="img"], [data-test], [class*="chart"], [id*="chart"]').length) {
@@ -20,6 +34,7 @@ function harden($) {
     }
   });
 
+  // stop client-side JS from re-injecting charts or live updates
   $('script').remove();
   $('iframe, embed').remove();
 }
@@ -29,17 +44,37 @@ app.get("/quote/:ticker", async (req, res) => {
   const target = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
 
   try {
-    const upstream = await fetch(target, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
-      }
-    });
+    const upstream = await fetchWithTimeout(
+      target,
+      {
+        headers: {
+          // realistic headers reduce anti bot responses
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept":
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache",
+          "Upgrade-Insecure-Requests": "1",
+          "Sec-Fetch-Site": "none",
+          "Sec-Fetch-Mode": "navigate",
+          "Sec-Fetch-User": "?1",
+          "Sec-Fetch-Dest": "document",
+          "Referer": "https://finance.yahoo.com/",
+          "Connection": "keep-alive"
+        }
+      },
+      20000
+    );
 
     if (!upstream.ok) {
-      res.status(upstream.status).send(`Upstream error fetching ${ticker}`);
-      return;
+      const text = await upstream.text().catch(() => "");
+      console.error(`Upstream ${upstream.status} for ${target}. Body start:`, text.slice(0, 200));
+      return res
+        .status(502)
+        .type("text/plain")
+        .send(`Upstream fetch failed (${upstream.status}). Try again or a different ticker.`);
     }
 
     const html = await upstream.text();
@@ -56,12 +91,16 @@ app.get("/quote/:ticker", async (req, res) => {
     res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
     res.send($.html());
   } catch (e) {
-    res.status(500).send(`Proxy error: ${e.message}`);
+    console.error("Proxy error:", e);
+    if (e.name === "AbortError") {
+      return res.status(504).type("text/plain").send("Upstream timeout (20s). Try again.");
+    }
+    res.status(500).type("text/plain").send(`Proxy error: ${e.message}`);
   }
 });
 
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK. Use /quote/TICKER for example /quote/AAPL");
+  res.type("text/plain").send("OK. Use /quote/TICKER (e.g., /quote/AAPL)");
 });
 
 const PORT = process.env.PORT || 3000;
