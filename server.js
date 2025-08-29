@@ -4,7 +4,7 @@ import * as cheerio from "cheerio";
 
 const app = express();
 
-// fetch with a timeout so requests do not hang forever
+// Fetch with a timeout so requests do not hang forever
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 20000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -16,61 +16,68 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 20000) {
   }
 }
 
-// remove charts and client scripts so the graph cannot appear or rehydrate
-function harden($) {
-  $('[data-test="qsp-chart"]').remove();           // main quote chart section
-  $('[data-testid="chart-container"]').remove();   // generic chart container
-  $('[data-test="sparkline"]').remove();           // tiny line charts
-  $('[class*="sparkline"]').remove();
+// We will NOT remove scripts or SVGs anymore.
+// Instead, inject conservative CSS that hides known chart containers only.
+function hideChartsWithCss($) {
+  // Insert CSS at the end of <head> so it wins specificity with !important.
+  // Targets:
+  //  - Main quote chart: [data-test="qsp-chart"]
+  //  - Some chart wrappers: [data-testid="chart-container"]
+  //  - Small sparklines: [data-test="sparkline"] and common sparkline aria-labels
+  //  - Fallback: any SVG explicitly labeled as a chart/sparkline
+  const css = `
+    /* Hide main quote chart section */
+    section[data-test="qsp-chart"] { display: none !important; }
 
-  $('[id*="chart"]').remove();                     // fallbacks
-  $('[class*="chart"]').remove();
+    /* Hide generic chart containers used in modules */
+    [data-testid="chart-container"] { display: none !important; }
 
-  // remove likely chart SVGs
-  $('svg').each((_, el) => {
-    const $el = $(el);
-    if ($el.closest('[role="img"], [data-test], [class*="chart"], [id*="chart"]').length) {
-      $el.remove();
-    }
-  });
+    /* Hide small sparkline charts that appear in summaries, sidebars, tables */
+    [data-test="sparkline"] { display: none !important; }
+    svg[aria-label*="sparkline" i] { display: none !important; }
 
-  // stop client-side JS from re-injecting charts or live updates
-  $('script').remove();
-  $('iframe, embed').remove();
+    /* Fallback: any SVG explicitly labeled as "chart" by accessibility labels */
+    svg[aria-label*="chart" i] { display: none !important; }
+
+    /* Optional: remove any empty gap where the main chart would be */
+    section[data-test="qsp-chart"] + * { margin-top: 0 !important; }
+  `.trim();
+
+  const head = $("head");
+  if (head.length) {
+    head.append(`<style id="study-hide-charts">${css}</style>`);
+  } else {
+    // Rare fallback: prepend in body if head missing (shouldn't happen)
+    $("body").prepend(`<style id="study-hide-charts">${css}</style>`);
+  }
 }
+
+const DESKTOP_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept":
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-User": "?1",
+  "Sec-Fetch-Dest": "document",
+  "Referer": "https://finance.yahoo.com/",
+  "Connection": "keep-alive"
+};
 
 app.get("/quote/:ticker", async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
   const target = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
 
   try {
-    const upstream = await fetchWithTimeout(
-      target,
-      {
-        headers: {
-          // realistic headers reduce anti bot responses
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Cache-Control": "no-cache",
-          "Pragma": "no-cache",
-          "Upgrade-Insecure-Requests": "1",
-          "Sec-Fetch-Site": "none",
-          "Sec-Fetch-Mode": "navigate",
-          "Sec-Fetch-User": "?1",
-          "Sec-Fetch-Dest": "document",
-          "Referer": "https://finance.yahoo.com/",
-          "Connection": "keep-alive"
-        }
-      },
-      20000
-    );
-
+    const upstream = await fetchWithTimeout(target, { headers: DESKTOP_HEADERS }, 20000);
     if (!upstream.ok) {
-      const text = await upstream.text().catch(() => "");
-      console.error(`Upstream ${upstream.status} for ${target}. Body start:`, text.slice(0, 200));
+      const body = await upstream.text().catch(() => "");
+      console.error(`Upstream ${upstream.status} for ${target}. Body start:`, body.slice(0, 200));
       return res
         .status(502)
         .type("text/plain")
@@ -80,15 +87,11 @@ app.get("/quote/:ticker", async (req, res) => {
     const html = await upstream.text();
     const $ = cheerio.load(html);
 
-    harden($);
+    // IMPORTANT: keep scripts/styles and just hide chart areas
+    hideChartsWithCss($);
 
-    $("body").prepend(`
-      <div style="font-family: system-ui, Arial; background:#fffbe6; border-bottom:1px solid #ddd; padding:10px; text-align:center;">
-        Charts removed by study configuration. Other information remains available.
-      </div>
-    `);
-
-    res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+    // Remove our previous banner to keep the page looking native
+    // res.setHeader("Content-Security-Policy", "frame-ancestors 'none'"); // optional; comment out if you plan to iframe
     res.send($.html());
   } catch (e) {
     console.error("Proxy error:", e);
