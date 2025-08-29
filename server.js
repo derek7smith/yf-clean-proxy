@@ -16,40 +16,39 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 20000) {
   }
 }
 
-// We will NOT remove scripts or SVGs anymore.
-// Instead, inject conservative CSS that hides known chart containers only.
+// Insert a <base> so relative URLs (CSS/JS/images) load from Yahoo, not your domain
+function ensureBaseHref($, origin) {
+  const hasBase = $("head base[href]").length > 0;
+  if (!hasBase) {
+    const baseTag = `<base href="${origin}">`;
+    if ($("head").length) $("head").prepend(baseTag);
+    else $("html").prepend(`<head>${baseTag}</head>`);
+  }
+}
+
+// Hide only chart containers via CSS (keep Yahoo’s own CSS/JS intact)
 function hideChartsWithCss($) {
-  // Insert CSS at the end of <head> so it wins specificity with !important.
-  // Targets:
-  //  - Main quote chart: [data-test="qsp-chart"]
-  //  - Some chart wrappers: [data-testid="chart-container"]
-  //  - Small sparklines: [data-test="sparkline"] and common sparkline aria-labels
-  //  - Fallback: any SVG explicitly labeled as a chart/sparkline
   const css = `
-    /* Hide main quote chart section */
+    /* Main quote chart */
     section[data-test="qsp-chart"] { display: none !important; }
 
-    /* Hide generic chart containers used in modules */
+    /* Common chart wrappers */
     [data-testid="chart-container"] { display: none !important; }
 
-    /* Hide small sparkline charts that appear in summaries, sidebars, tables */
+    /* Small sparklines */
     [data-test="sparkline"] { display: none !important; }
     svg[aria-label*="sparkline" i] { display: none !important; }
 
-    /* Fallback: any SVG explicitly labeled as "chart" by accessibility labels */
+    /* Any SVG explicitly labeled as a chart (accessibility label) */
     svg[aria-label*="chart" i] { display: none !important; }
 
-    /* Optional: remove any empty gap where the main chart would be */
+    /* Remove extra gap if any after hiding main chart */
     section[data-test="qsp-chart"] + * { margin-top: 0 !important; }
   `.trim();
 
   const head = $("head");
-  if (head.length) {
-    head.append(`<style id="study-hide-charts">${css}</style>`);
-  } else {
-    // Rare fallback: prepend in body if head missing (shouldn't happen)
-    $("body").prepend(`<style id="study-hide-charts">${css}</style>`);
-  }
+  if (head.length) head.append(`<style id="study-hide-charts">${css}</style>`);
+  else $("body").prepend(`<style id="study-hide-charts">${css}</style>`);
 }
 
 const DESKTOP_HEADERS = {
@@ -71,7 +70,8 @@ const DESKTOP_HEADERS = {
 
 app.get("/quote/:ticker", async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
-  const target = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
+  const origin = "https://finance.yahoo.com";
+  const target = `${origin}/quote/${encodeURIComponent(ticker)}`;
 
   try {
     const upstream = await fetchWithTimeout(target, { headers: DESKTOP_HEADERS }, 20000);
@@ -87,11 +87,13 @@ app.get("/quote/:ticker", async (req, res) => {
     const html = await upstream.text();
     const $ = cheerio.load(html);
 
-    // IMPORTANT: keep scripts/styles and just hide chart areas
+    // 1) Make relative URLs point to Yahoo (fixes missing CSS/JS/icons)
+    ensureBaseHref($, origin);
+
+    // 2) Keep Yahoo’s layout/scripts, just hide charts
     hideChartsWithCss($);
 
-    // Remove our previous banner to keep the page looking native
-    // res.setHeader("Content-Security-Policy", "frame-ancestors 'none'"); // optional; comment out if you plan to iframe
+    // Do NOT strip scripts; do NOT set CSP that might block Yahoo assets.
     res.send($.html());
   } catch (e) {
     console.error("Proxy error:", e);
